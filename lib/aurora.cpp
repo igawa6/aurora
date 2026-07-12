@@ -1,6 +1,7 @@
 #include <aurora/aurora.h>
 
 #ifdef AURORA_ENABLE_GX
+#include "aux_window.hpp"
 #include "gfx/common.hpp"
 #include "gfx/render_worker.hpp"
 #include "gx/fifo.hpp"
@@ -347,6 +348,7 @@ void end_frame() noexcept {
     } else {
       Log.info("Skipping present; window not presentable");
     }
+    auxwin::encode(encoder);
     webgpu::gpu_prof::frame_end(encoder);
     const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Redraw command buffer"};
     const auto buffer = encoder.Finish(&cmdBufDescriptor);
@@ -355,6 +357,7 @@ void end_frame() noexcept {
       g_queue.Submit(1, &buffer);
     }
     webgpu::gpu_prof::after_submit();
+    auxwin::present();
     if (canPresent && g_surface) {
       ZoneScopedN("Present");
       wgpu::ConvertibleStatus status = wgpu::Status::Error;

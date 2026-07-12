@@ -1,6 +1,7 @@
 #include "window.hpp"
 
 #ifdef AURORA_ENABLE_GX
+#include "aux_window.hpp"
 #include "imgui.hpp"
 #include "webgpu/gpu.hpp"
 #endif
@@ -144,6 +145,9 @@ void sync_paused() {
 
 void process_event(SDL_Event& event) {
 #ifdef AURORA_ENABLE_GX
+  if (auxwin::filter_event(event)) {
+    return;
+  }
   imgui::process_event(event);
 #endif
 #ifdef AURORA_ENABLE_RMLUI

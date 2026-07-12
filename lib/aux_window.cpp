@@ -14,6 +14,10 @@
 #include <SDL3/SDL_properties.h>
 #include <SDL3/SDL_video.h>
 
+#ifdef __ANDROID__
+#include <android/native_window.h>
+#endif
+
 #include <atomic>
 #include <mutex>
 
@@ -40,6 +44,22 @@ std::atomic<bool> g_needsConfigure{false};
 std::atomic<uint32_t> g_pendingWidth{0};
 std::atomic<uint32_t> g_pendingHeight{0};
 std::atomic<bool> g_closeRequested{false};
+
+// Externally-managed native window (Android Presentation surface). Attach and
+// detach requests are staged here and consumed on the render worker.
+void* g_pendingNativeWindow = nullptr;
+bool g_nativeWindowDirty = false;
+void* g_currentNativeWindow = nullptr;
+
+void release_native_window(void* window) {
+#ifdef __ANDROID__
+  if (window != nullptr) {
+    ANativeWindow_release(static_cast<ANativeWindow*>(window));
+  }
+#else
+  (void)window;
+#endif
+}
 
 // Render-worker state between encode() and present()
 wgpu::Texture g_acquiredTexture;
@@ -184,6 +204,85 @@ void set_source(wgpu::TextureView view, uint32_t width, uint32_t height) {
 
 bool consume_close_request() { return g_closeRequested.exchange(false); }
 
+void set_native_window(void* nativeWindow, uint32_t width, uint32_t height) {
+  std::lock_guard lock{g_mutex};
+  // Drop a staged-but-unconsumed window that is being replaced.
+  if (g_nativeWindowDirty && g_pendingNativeWindow != nullptr && g_pendingNativeWindow != nativeWindow) {
+    release_native_window(g_pendingNativeWindow);
+  }
+  g_pendingNativeWindow = nativeWindow;
+  g_pendingWidth = width;
+  g_pendingHeight = height;
+  g_nativeWindowDirty = true;
+}
+
+namespace {
+
+// Render worker: apply a staged native-window attach/detach. Caller holds g_mutex.
+void consume_native_window_locked() {
+  if (!g_nativeWindowDirty) {
+    return;
+  }
+  g_nativeWindowDirty = false;
+
+  if (g_surface && g_window == nullptr) {
+    g_surface.Unconfigure();
+    g_surface = {};
+  }
+  if (g_currentNativeWindow != nullptr && g_currentNativeWindow != g_pendingNativeWindow) {
+    release_native_window(g_currentNativeWindow);
+  }
+  g_currentNativeWindow = g_pendingNativeWindow;
+  g_pendingNativeWindow = nullptr;
+  if (g_currentNativeWindow == nullptr) {
+    g_active = g_window != nullptr;
+    return;
+  }
+
+#ifdef __ANDROID__
+  wgpu::SurfaceSourceAndroidNativeWindow source;
+  source.window = g_currentNativeWindow;
+  const wgpu::SurfaceDescriptor surfaceDescriptor{
+      .nextInChain = &source,
+      .label = "Aux Surface (native window)",
+  };
+  g_surface = webgpu::g_instance.CreateSurface(&surfaceDescriptor);
+  if (!g_surface) {
+    Log.error("Failed to create aux surface from native window");
+    release_native_window(g_currentNativeWindow);
+    g_currentNativeWindow = nullptr;
+    g_active = false;
+    return;
+  }
+  g_surfaceConfig = wgpu::SurfaceConfiguration{
+      .device = webgpu::g_device,
+      .format = webgpu::g_graphicsConfig.surfaceConfiguration.format,
+      .usage = wgpu::TextureUsage::RenderAttachment,
+      .presentMode = wgpu::PresentMode::Fifo,
+  };
+  configure_surface_locked(g_pendingWidth.load(), g_pendingHeight.load());
+  if (!g_sampler) {
+    const wgpu::SamplerDescriptor samplerDescriptor{
+        .label = "Aux Blit Sampler",
+        .addressModeU = wgpu::AddressMode::ClampToEdge,
+        .addressModeV = wgpu::AddressMode::ClampToEdge,
+        .addressModeW = wgpu::AddressMode::ClampToEdge,
+        .magFilter = wgpu::FilterMode::Linear,
+        .minFilter = wgpu::FilterMode::Linear,
+    };
+    g_sampler = webgpu::g_device.CreateSampler(&samplerDescriptor);
+  }
+  g_active = true;
+  Log.info("Aux native window attached ({}x{})", g_pendingWidth.load(), g_pendingHeight.load());
+#else
+  Log.warn("set_native_window: unsupported on this platform");
+  release_native_window(g_currentNativeWindow);
+  g_currentNativeWindow = nullptr;
+#endif
+}
+
+} // namespace
+
 bool filter_event(const SDL_Event& event) {
   if (event.type < SDL_EVENT_WINDOW_FIRST || event.type > SDL_EVENT_WINDOW_LAST) {
     return false;
@@ -216,6 +315,7 @@ void encode(const wgpu::CommandEncoder& encoder) {
   uint32_t surfaceHeight = 0;
   {
     std::lock_guard lock{g_mutex};
+    consume_native_window_locked();
     if (!g_active || !g_surface) {
       return;
     }

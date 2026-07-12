@@ -40,4 +40,8 @@ bool consume_close_request();
 /// frame. No-op on platforms without native-window support.
 void set_native_window(void* nativeWindow, uint32_t width, uint32_t height);
 
+/// Current auxiliary surface size in pixels. Returns false when no surface is
+/// active. Thread-safe.
+bool get_surface_size(uint32_t* width, uint32_t* height);
+
 } // namespace aurora::auxwin

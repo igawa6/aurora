@@ -18,6 +18,7 @@
 #include <android/native_window.h>
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 
@@ -204,6 +205,16 @@ void set_source(wgpu::TextureView view, uint32_t width, uint32_t height) {
 
 bool consume_close_request() { return g_closeRequested.exchange(false); }
 
+bool get_surface_size(uint32_t* width, uint32_t* height) {
+  std::lock_guard lock{g_mutex};
+  if (!g_active || !g_surface) {
+    return false;
+  }
+  *width = g_surfaceConfig.width;
+  *height = g_surfaceConfig.height;
+  return true;
+}
+
 void set_native_window(void* nativeWindow, uint32_t width, uint32_t height) {
   std::lock_guard lock{g_mutex};
   // Drop a staged-but-unconsumed window that is being replaced.
@@ -358,16 +369,21 @@ void encode(const wgpu::CommandEncoder& encoder) {
       .colorAttachments = attachments.data(),
   };
   const auto pass = encoder.BeginRenderPass(&renderPassDescriptor);
-  if (source.view && source.width != 0 && source.height != 0) {
-    const auto viewport =
-        webgpu::calculate_present_viewport(surfaceWidth, surfaceHeight, source.width, source.height);
+  if (source.view && source.width != 0 && source.height != 0 && surfaceWidth != 0 && surfaceHeight != 0) {
+    // Aspect-fit letterbox; never stretch.
+    const float scale = std::min(static_cast<float>(surfaceWidth) / static_cast<float>(source.width),
+                                 static_cast<float>(surfaceHeight) / static_cast<float>(source.height));
+    const float viewWidth = static_cast<float>(source.width) * scale;
+    const float viewHeight = static_cast<float>(source.height) * scale;
+    const float viewLeft = (static_cast<float>(surfaceWidth) - viewWidth) * 0.5f;
+    const float viewTop = (static_cast<float>(surfaceHeight) - viewHeight) * 0.5f;
     const webgpu::TextureWithSampler sourceBinding{
         .view = source.view,
         .sampler = g_sampler,
     };
     pass.SetPipeline(webgpu::g_CopyPipeline);
     pass.SetBindGroup(0, webgpu::create_copy_bind_group(sourceBinding), 0, nullptr);
-    pass.SetViewport(viewport.left, viewport.top, viewport.width, viewport.height, viewport.znear, viewport.zfar);
+    pass.SetViewport(viewLeft, viewTop, viewWidth, viewHeight, 0.f, 1.f);
     pass.Draw(3);
   }
   pass.End();

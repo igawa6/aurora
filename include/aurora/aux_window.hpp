@@ -32,4 +32,12 @@ void set_source(wgpu::TextureView view, uint32_t width, uint32_t height);
 /// True once after the user requested closing the auxiliary window.
 bool consume_close_request();
 
+/// Attach an externally-managed native window (e.g. an Android Presentation
+/// surface as an ANativeWindow*) as the auxiliary output instead of an SDL
+/// window. Pass nullptr to detach. Ownership of the window reference transfers
+/// to aurora (released with ANativeWindow_release on Android). Callable from
+/// any thread; the surface is (re)created on the render worker at the next
+/// frame. No-op on platforms without native-window support.
+void set_native_window(void* nativeWindow, uint32_t width, uint32_t height);
+
 } // namespace aurora::auxwin

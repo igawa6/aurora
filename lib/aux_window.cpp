@@ -217,6 +217,29 @@ bool get_surface_size(uint32_t* width, uint32_t* height) {
 
 void set_native_window(void* nativeWindow, uint32_t width, uint32_t height) {
   std::lock_guard lock{g_mutex};
+  if (nativeWindow == nullptr) {
+    // Synchronous detach: per the Android surfaceDestroyed contract, the
+    // surface must not be touched after this returns. encode()/present() hold
+    // g_mutex for their full duration, so this cannot interleave with GPU use
+    // (e.g. when the display sleeps while the game idles).
+    if (g_nativeWindowDirty && g_pendingNativeWindow != nullptr) {
+      release_native_window(g_pendingNativeWindow);
+    }
+    g_pendingNativeWindow = nullptr;
+    g_nativeWindowDirty = false;
+    if (g_currentNativeWindow != nullptr) {
+      g_acquiredTexture = {};
+      g_source = {};
+      if (g_surface && g_window == nullptr) {
+        g_surface.Unconfigure();
+        g_surface = {};
+      }
+      release_native_window(g_currentNativeWindow);
+      g_currentNativeWindow = nullptr;
+      g_active = g_window != nullptr;
+    }
+    return;
+  }
   // Drop a staged-but-unconsumed window that is being replaced.
   if (g_nativeWindowDirty && g_pendingNativeWindow != nullptr && g_pendingNativeWindow != nativeWindow) {
     release_native_window(g_pendingNativeWindow);
@@ -320,24 +343,21 @@ bool filter_event(const SDL_Event& event) {
 }
 
 void encode(const wgpu::CommandEncoder& encoder) {
-  wgpu::Surface surface;
-  Source source;
-  uint32_t surfaceWidth = 0;
-  uint32_t surfaceHeight = 0;
-  {
-    std::lock_guard lock{g_mutex};
-    consume_native_window_locked();
-    if (!g_active || !g_surface) {
-      return;
-    }
-    if (g_needsConfigure.exchange(false)) {
-      configure_surface_locked(g_pendingWidth.load(), g_pendingHeight.load());
-    }
-    surface = g_surface;
-    source = g_source;
-    surfaceWidth = g_surfaceConfig.width;
-    surfaceHeight = g_surfaceConfig.height;
+  // Hold the mutex for the entire encode so a synchronous native-window
+  // detach (set_native_window(nullptr)) can never interleave with GPU use of
+  // the surface.
+  std::lock_guard lock{g_mutex};
+  consume_native_window_locked();
+  if (!g_active || !g_surface) {
+    return;
   }
+  if (g_needsConfigure.exchange(false)) {
+    configure_surface_locked(g_pendingWidth.load(), g_pendingHeight.load());
+  }
+  const wgpu::Surface& surface = g_surface;
+  const Source& source = g_source;
+  const uint32_t surfaceWidth = g_surfaceConfig.width;
+  const uint32_t surfaceHeight = g_surfaceConfig.height;
 
   wgpu::SurfaceTexture surfaceTexture;
   surface.GetCurrentTexture(&surfaceTexture);
@@ -390,17 +410,13 @@ void encode(const wgpu::CommandEncoder& encoder) {
 }
 
 void present() {
-  wgpu::Surface surface;
-  {
-    std::lock_guard lock{g_mutex};
-    if (!g_active || !g_surface || !g_acquiredTexture) {
-      g_acquiredTexture = {};
-      return;
-    }
-    surface = g_surface;
+  std::lock_guard lock{g_mutex};
+  if (!g_active || !g_surface || !g_acquiredTexture) {
+    g_acquiredTexture = {};
+    return;
   }
   g_acquiredTexture = {};
-  const wgpu::ConvertibleStatus status = surface.Present();
+  const wgpu::ConvertibleStatus status = g_surface.Present();
   if (!status) {
     Log.warn("Aux surface present failed");
     g_needsConfigure = true;

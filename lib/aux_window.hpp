@@ -16,6 +16,14 @@ bool filter_event(const SDL_Event& event);
 /// submit.
 void present();
 
+/// Like present() but uses a caller-owned encoder and queue instead of
+/// creating per-frame GPU command objects (Android memory-pressure path).
+void present_with_encoder(wgpu::CommandEncoder* enc, wgpu::Queue* submitQueue);
+
+/// Like present() but records the blit into a caller-owned encoder and
+/// submits via a caller-owned queue — no separate GPU-command-object allocs.
+void present_with_encoder(wgpu::CommandEncoder* encoder, wgpu::Queue* submitQueue);
+
 } // namespace aurora::auxwin
 
 #endif

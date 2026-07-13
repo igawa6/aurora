@@ -32,6 +32,14 @@ struct Source {
   uint32_t height = 0;
 };
 
+// Lock order: g_surfaceMutex before g_mutex.
+// g_surfaceMutex serializes GPU use of the surface (encode/present, which can
+// block inside GetCurrentTexture/Present) against surface teardown. g_mutex
+// guards shared state and is only ever held briefly, so the game and UI
+// threads (set_source, get_surface_size, staging) never stall behind a
+// blocking present — holding one mutex across present caused whole-game
+// freezes on Android when the bottom display hiccuped.
+std::mutex g_surfaceMutex;
 std::mutex g_mutex;
 bool g_active = false;
 SDL_Window* g_window = nullptr;
@@ -81,7 +89,7 @@ bool create(const CreateInfo& info) {
     Log.error("create: graphics device not initialized");
     return false;
   }
-  std::lock_guard lock{g_mutex};
+  std::scoped_lock locks{g_surfaceMutex, g_mutex};
   if (g_window != nullptr) {
     return true;
   }
@@ -178,7 +186,7 @@ void destroy() {
   // Drain the render worker so encode()/present() can no longer touch the
   // surface before it is torn down.
   gfx::synchronize();
-  std::lock_guard lock{g_mutex};
+  std::scoped_lock locks{g_surfaceMutex, g_mutex};
   g_acquiredTexture = {};
   if (g_surface) {
     g_surface.Unconfigure();
@@ -216,12 +224,12 @@ bool get_surface_size(uint32_t* width, uint32_t* height) {
 }
 
 void set_native_window(void* nativeWindow, uint32_t width, uint32_t height) {
-  std::lock_guard lock{g_mutex};
   if (nativeWindow == nullptr) {
     // Synchronous detach: per the Android surfaceDestroyed contract, the
-    // surface must not be touched after this returns. encode()/present() hold
-    // g_mutex for their full duration, so this cannot interleave with GPU use
+    // surface must not be touched after this returns. Taking g_surfaceMutex
+    // waits out any in-flight encode()/present() GPU use of the surface
     // (e.g. when the display sleeps while the game idles).
+    std::scoped_lock locks{g_surfaceMutex, g_mutex};
     if (g_nativeWindowDirty && g_pendingNativeWindow != nullptr) {
       release_native_window(g_pendingNativeWindow);
     }
@@ -240,6 +248,7 @@ void set_native_window(void* nativeWindow, uint32_t width, uint32_t height) {
     }
     return;
   }
+  std::lock_guard lock{g_mutex};
   // Drop a staged-but-unconsumed window that is being replaced.
   if (g_nativeWindowDirty && g_pendingNativeWindow != nullptr && g_pendingNativeWindow != nativeWindow) {
     release_native_window(g_pendingNativeWindow);
@@ -252,7 +261,8 @@ void set_native_window(void* nativeWindow, uint32_t width, uint32_t height) {
 
 namespace {
 
-// Render worker: apply a staged native-window attach/detach. Caller holds g_mutex.
+// Render worker: apply a staged native-window attach/detach. Caller holds
+// BOTH g_surfaceMutex and g_mutex.
 void consume_native_window_locked() {
   if (!g_nativeWindowDirty) {
     return;
@@ -343,21 +353,30 @@ bool filter_event(const SDL_Event& event) {
 }
 
 void encode(const wgpu::CommandEncoder& encoder) {
-  // Hold the mutex for the entire encode so a synchronous native-window
-  // detach (set_native_window(nullptr)) can never interleave with GPU use of
-  // the surface.
-  std::lock_guard lock{g_mutex};
-  consume_native_window_locked();
-  if (!g_active || !g_surface) {
-    return;
+  // g_surfaceMutex is held for the entire encode so a synchronous
+  // native-window detach can never interleave with GPU use of the surface;
+  // g_mutex is only held briefly for the state snapshot.
+  std::lock_guard surfaceLock{g_surfaceMutex};
+  wgpu::Surface surface;
+  wgpu::Sampler sampler;
+  Source source;
+  uint32_t surfaceWidth = 0;
+  uint32_t surfaceHeight = 0;
+  {
+    std::lock_guard lock{g_mutex};
+    consume_native_window_locked();
+    if (!g_active || !g_surface) {
+      return;
+    }
+    if (g_needsConfigure.exchange(false)) {
+      configure_surface_locked(g_pendingWidth.load(), g_pendingHeight.load());
+    }
+    surface = g_surface;
+    sampler = g_sampler;
+    source = g_source;
+    surfaceWidth = g_surfaceConfig.width;
+    surfaceHeight = g_surfaceConfig.height;
   }
-  if (g_needsConfigure.exchange(false)) {
-    configure_surface_locked(g_pendingWidth.load(), g_pendingHeight.load());
-  }
-  const wgpu::Surface& surface = g_surface;
-  const Source& source = g_source;
-  const uint32_t surfaceWidth = g_surfaceConfig.width;
-  const uint32_t surfaceHeight = g_surfaceConfig.height;
 
   wgpu::SurfaceTexture surfaceTexture;
   surface.GetCurrentTexture(&surfaceTexture);
@@ -399,7 +418,7 @@ void encode(const wgpu::CommandEncoder& encoder) {
     const float viewTop = (static_cast<float>(surfaceHeight) - viewHeight) * 0.5f;
     const webgpu::TextureWithSampler sourceBinding{
         .view = source.view,
-        .sampler = g_sampler,
+        .sampler = sampler,
     };
     pass.SetPipeline(webgpu::g_CopyPipeline);
     pass.SetBindGroup(0, webgpu::create_copy_bind_group(sourceBinding), 0, nullptr);
@@ -410,13 +429,20 @@ void encode(const wgpu::CommandEncoder& encoder) {
 }
 
 void present() {
-  std::lock_guard lock{g_mutex};
-  if (!g_active || !g_surface || !g_acquiredTexture) {
-    g_acquiredTexture = {};
+  std::lock_guard surfaceLock{g_surfaceMutex};
+  if (!g_acquiredTexture) {
     return;
   }
   g_acquiredTexture = {};
-  const wgpu::ConvertibleStatus status = g_surface.Present();
+  wgpu::Surface surface;
+  {
+    std::lock_guard lock{g_mutex};
+    if (!g_active || !g_surface) {
+      return;
+    }
+    surface = g_surface;
+  }
+  const wgpu::ConvertibleStatus status = surface.Present();
   if (!status) {
     Log.warn("Aux surface present failed");
     g_needsConfigure = true;

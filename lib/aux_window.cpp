@@ -70,9 +70,6 @@ void release_native_window(void* window) {
 #endif
 }
 
-// Render-worker state between encode() and present()
-wgpu::Texture g_acquiredTexture;
-
 void configure_surface_locked(uint32_t width, uint32_t height) {
   if (!g_surface || width == 0 || height == 0) {
     return;
@@ -187,7 +184,6 @@ void destroy() {
   // surface before it is torn down.
   gfx::synchronize();
   std::scoped_lock locks{g_surfaceMutex, g_mutex};
-  g_acquiredTexture = {};
   if (g_surface) {
     g_surface.Unconfigure();
     g_surface = {};
@@ -236,7 +232,6 @@ void set_native_window(void* nativeWindow, uint32_t width, uint32_t height) {
     g_pendingNativeWindow = nullptr;
     g_nativeWindowDirty = false;
     if (g_currentNativeWindow != nullptr) {
-      g_acquiredTexture = {};
       g_source = {};
       if (g_surface && g_window == nullptr) {
         g_surface.Unconfigure();
@@ -352,10 +347,12 @@ bool filter_event(const SDL_Event& event) {
   return true;
 }
 
-void encode(const wgpu::CommandEncoder& encoder) {
-  // g_surfaceMutex is held for the entire encode so a synchronous
-  // native-window detach can never interleave with GPU use of the surface;
-  // g_mutex is only held briefly for the state snapshot.
+void present() {
+  // Single critical section for ALL GPU use of the aux surface — acquire,
+  // blit (own encoder + submit), and present. Previously the blit was
+  // recorded into the frame encoder in one lock scope and submitted outside
+  // it, so a synchronous native-window detach (Android screen-off) could
+  // destroy the surface between the two and crash the submit.
   std::lock_guard surfaceLock{g_surfaceMutex};
   wgpu::Surface surface;
   wgpu::Sampler sampler;
@@ -391,57 +388,50 @@ void encode(const wgpu::CommandEncoder& encoder) {
     Log.warn("Aux surface texture unavailable: {}", static_cast<int>(surfaceTexture.status));
     return;
   }
-  g_acquiredTexture = std::move(surfaceTexture.texture);
-  const auto view = g_acquiredTexture.CreateView();
+  const auto view = surfaceTexture.texture.CreateView();
 
-  const std::array attachments{
-      wgpu::RenderPassColorAttachment{
-          .view = view,
-          .loadOp = wgpu::LoadOp::Clear,
-          .storeOp = wgpu::StoreOp::Store,
-          .clearValue = {0.0, 0.0, 0.0, 1.0},
-      },
-  };
-  const wgpu::RenderPassDescriptor renderPassDescriptor{
-      .label = "Aux window blit pass",
-      .colorAttachmentCount = attachments.size(),
-      .colorAttachments = attachments.data(),
-  };
-  const auto pass = encoder.BeginRenderPass(&renderPassDescriptor);
-  if (source.view && source.width != 0 && source.height != 0 && surfaceWidth != 0 && surfaceHeight != 0) {
-    // Aspect-fit letterbox; never stretch.
-    const float scale = std::min(static_cast<float>(surfaceWidth) / static_cast<float>(source.width),
-                                 static_cast<float>(surfaceHeight) / static_cast<float>(source.height));
-    const float viewWidth = static_cast<float>(source.width) * scale;
-    const float viewHeight = static_cast<float>(source.height) * scale;
-    const float viewLeft = (static_cast<float>(surfaceWidth) - viewWidth) * 0.5f;
-    const float viewTop = (static_cast<float>(surfaceHeight) - viewHeight) * 0.5f;
-    const webgpu::TextureWithSampler sourceBinding{
-        .view = source.view,
-        .sampler = sampler,
-    };
-    pass.SetPipeline(webgpu::g_CopyPipeline);
-    pass.SetBindGroup(0, webgpu::create_copy_bind_group(sourceBinding), 0, nullptr);
-    pass.SetViewport(viewLeft, viewTop, viewWidth, viewHeight, 0.f, 1.f);
-    pass.Draw(3);
-  }
-  pass.End();
-}
-
-void present() {
-  std::lock_guard surfaceLock{g_surfaceMutex};
-  if (!g_acquiredTexture) {
-    return;
-  }
-  g_acquiredTexture = {};
-  wgpu::Surface surface;
+  const wgpu::CommandEncoderDescriptor encoderDescriptor{.label = "Aux window encoder"};
+  const auto encoder = webgpu::g_device.CreateCommandEncoder(&encoderDescriptor);
   {
-    std::lock_guard lock{g_mutex};
-    if (!g_active || !g_surface) {
-      return;
+    const std::array attachments{
+        wgpu::RenderPassColorAttachment{
+            .view = view,
+            .loadOp = wgpu::LoadOp::Clear,
+            .storeOp = wgpu::StoreOp::Store,
+            .clearValue = {0.0, 0.0, 0.0, 1.0},
+        },
+    };
+    const wgpu::RenderPassDescriptor renderPassDescriptor{
+        .label = "Aux window blit pass",
+        .colorAttachmentCount = attachments.size(),
+        .colorAttachments = attachments.data(),
+    };
+    const auto pass = encoder.BeginRenderPass(&renderPassDescriptor);
+    if (source.view && source.width != 0 && source.height != 0 && surfaceWidth != 0 &&
+        surfaceHeight != 0)
+    {
+      // Aspect-fit letterbox; never stretch.
+      const float scale = std::min(static_cast<float>(surfaceWidth) / static_cast<float>(source.width),
+                                   static_cast<float>(surfaceHeight) / static_cast<float>(source.height));
+      const float viewWidth = static_cast<float>(source.width) * scale;
+      const float viewHeight = static_cast<float>(source.height) * scale;
+      const float viewLeft = (static_cast<float>(surfaceWidth) - viewWidth) * 0.5f;
+      const float viewTop = (static_cast<float>(surfaceHeight) - viewHeight) * 0.5f;
+      const webgpu::TextureWithSampler sourceBinding{
+          .view = source.view,
+          .sampler = sampler,
+      };
+      pass.SetPipeline(webgpu::g_CopyPipeline);
+      pass.SetBindGroup(0, webgpu::create_copy_bind_group(sourceBinding), 0, nullptr);
+      pass.SetViewport(viewLeft, viewTop, viewWidth, viewHeight, 0.f, 1.f);
+      pass.Draw(3);
     }
-    surface = g_surface;
+    pass.End();
   }
+  const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Aux window command buffer"};
+  const auto buffer = encoder.Finish(&cmdBufDescriptor);
+  webgpu::g_queue.Submit(1, &buffer);
+
   const wgpu::ConvertibleStatus status = surface.Present();
   if (!status) {
     Log.warn("Aux surface present failed");

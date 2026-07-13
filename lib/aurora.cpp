@@ -348,7 +348,6 @@ void end_frame() noexcept {
     } else {
       Log.info("Skipping present; window not presentable");
     }
-    auxwin::encode(encoder);
     webgpu::gpu_prof::frame_end(encoder);
     const wgpu::CommandBufferDescriptor cmdBufDescriptor{.label = "Redraw command buffer"};
     const auto buffer = encoder.Finish(&cmdBufDescriptor);

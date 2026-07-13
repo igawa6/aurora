@@ -58,6 +58,7 @@ std::atomic<bool> g_closeRequested{false};
 // detach requests are staged here and consumed on the render worker.
 void* g_pendingNativeWindow = nullptr;
 bool g_nativeWindowDirty = false;
+bool g_pendingDetach = false;
 void* g_currentNativeWindow = nullptr;
 
 void release_native_window(void* window) {
@@ -221,26 +222,17 @@ bool get_surface_size(uint32_t* width, uint32_t* height) {
 
 void set_native_window(void* nativeWindow, uint32_t width, uint32_t height) {
   if (nativeWindow == nullptr) {
-    // Synchronous detach: per the Android surfaceDestroyed contract, the
-    // surface must not be touched after this returns. Taking g_surfaceMutex
-    // waits out any in-flight encode()/present() GPU use of the surface
-    // (e.g. when the display sleeps while the game idles).
-    std::scoped_lock locks{g_surfaceMutex, g_mutex};
+    // Stage the detach — do NOT block on g_surfaceMutex. Synchronous
+    // detach would stall the Android UI thread while the render worker
+    // holds the surface mutex inside GetCurrentTexture/Present, and
+    // accumulated stalls trigger ANR kills on Android.
+    std::lock_guard lock{g_mutex};
     if (g_nativeWindowDirty && g_pendingNativeWindow != nullptr) {
       release_native_window(g_pendingNativeWindow);
+      g_pendingNativeWindow = nullptr;
     }
-    g_pendingNativeWindow = nullptr;
     g_nativeWindowDirty = false;
-    if (g_currentNativeWindow != nullptr) {
-      g_source = {};
-      if (g_surface && g_window == nullptr) {
-        g_surface.Unconfigure();
-        g_surface = {};
-      }
-      release_native_window(g_currentNativeWindow);
-      g_currentNativeWindow = nullptr;
-      g_active = g_window != nullptr;
-    }
+    g_pendingDetach = true;
     return;
   }
   std::lock_guard lock{g_mutex};
@@ -259,6 +251,22 @@ namespace {
 // Render worker: apply a staged native-window attach/detach. Caller holds
 // BOTH g_surfaceMutex and g_mutex.
 void consume_native_window_locked() {
+  // Detach takes priority — runs inside the surface lock so the render
+  // worker cannot interleave with GPU use of the surface.
+  if (g_pendingDetach) {
+    g_pendingDetach = false;
+    if (g_currentNativeWindow != nullptr) {
+      g_source = {};
+      if (g_surface && g_window == nullptr) {
+        g_surface.Unconfigure();
+        g_surface = {};
+      }
+      release_native_window(g_currentNativeWindow);
+      g_currentNativeWindow = nullptr;
+      g_active = g_window != nullptr;
+    }
+  }
+
   if (!g_nativeWindowDirty) {
     return;
   }

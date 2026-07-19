@@ -244,6 +244,10 @@ std::optional<std::pair<uint32_t, uint32_t>> parse_dimensions(std::string_view t
   return std::pair{*width, *height};
 }
 
+// No legitimate GX texture approaches this; anything larger means the
+// descriptor cannot be trusted (freed or reused ResTIMG).
+constexpr uint32_t kMaxHashableTextureBytes = 64u * 1024u * 1024u;
+
 uint32_t texture_base_level_size(const GXTexObj_& obj) noexcept {
   switch (obj.format()) {
   case GX_TF_R8_PC:
@@ -267,7 +271,10 @@ std::optional<uint64_t> compute_referenced_tlut_hash(const GXTexObj_& obj,
                                                      aurora::ArrayRef<uint8_t> tlutData) noexcept {
   const uint32_t textureSize = texture_base_level_size(obj);
   const auto* textureData = static_cast<const uint8_t*>(obj.data);
-  if (!is_palette_format(obj.format()) || !obj.has_data() || textureSize == 0 || tlutData.empty()) {
+  // Same bound as build_source_key_base: this walks textureSize bytes, so a
+  // descriptor with nonsense dimensions would read off the end.
+  if (!is_palette_format(obj.format()) || !obj.has_data() || textureSize == 0 ||
+      textureSize > kMaxHashableTextureBytes || tlutData.empty()) {
     return std::nullopt;
   }
 
@@ -346,8 +353,13 @@ aurora::texture::TextureSourceKey build_source_key_base(const GXTexObj_& obj) no
       .hasTlut = is_palette_format(obj.format()),
   };
 
+  // Bound the hash: the size comes from the texture's declared dimensions, so
+  // a GXTexObj_ pointing at a freed or reused descriptor yields a nonsense
+  // extent (a real crash had XXH64 asked for 1.45 GB from a pointer that
+  // faulted 24 bytes in). An untrustworthy texture gets no replacement rather
+  // than taking the process down.
   const uint32_t textureSize = texture_base_level_size(obj);
-  if (obj.has_data() && textureSize != 0) {
+  if (obj.has_data() && textureSize != 0 && textureSize <= kMaxHashableTextureBytes) {
     key.textureHash = XXH64(obj.data, textureSize, 0);
   }
   return key;

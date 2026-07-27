@@ -53,6 +53,9 @@ extern TextureWithSampler g_depthBuffer;
 extern TextureWithSampler g_normalBuffer;
 extern wgpu::RenderPipeline g_CopyPipeline;
 extern wgpu::RenderPipeline g_CopyPremultipliedAlphaPipeline;
+/// g_CopyPipeline modulated by the render pass's blend constant (out = src *
+/// constant). Used by the aux window to apply its dim at present time.
+extern wgpu::RenderPipeline g_CopyDimPipeline;
 extern wgpu::BindGroup g_CopyBindGroup;
 extern wgpu::Instance g_instance;
 extern wgpu::AdapterInfo g_adapterInfo;

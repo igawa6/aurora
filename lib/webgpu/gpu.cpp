@@ -48,6 +48,7 @@ TextureWithSampler g_depthBuffer;
 // EFB -> XFB copy pipeline
 static wgpu::BindGroupLayout g_CopyBindGroupLayout;
 wgpu::RenderPipeline g_CopyPipeline;
+wgpu::RenderPipeline g_CopyDimPipeline;
 wgpu::RenderPipeline g_CopyPremultipliedAlphaPipeline;
 wgpu::BindGroup g_CopyBindGroup;
 static AuroraSampler g_Resampler = SAMPLER_BILINEAR;
@@ -530,6 +531,26 @@ fn fs_premultiplied_alpha(in: VertexOutput) -> @location(0) vec4<f32> {
   };
   g_CopyPremultipliedAlphaPipeline =
       make_copy_pipeline("XFB Premultiplied Alpha Copy Pipeline", "fs_premultiplied_alpha", &premultipliedAlphaBlend);
+
+  // Same copy, modulated by the pass's blend constant: out = src * constant.
+  // The aux window uses it to darken the second screen at PRESENT time rather
+  // than baking a dim into the captured picture, so the fade keeps running on
+  // frames where the source texture is not refreshed (see aux_window.cpp).
+  const wgpu::BlendState constantModulateBlend{
+      .color =
+          {
+              .operation = wgpu::BlendOperation::Add,
+              .srcFactor = wgpu::BlendFactor::Constant,
+              .dstFactor = wgpu::BlendFactor::Zero,
+          },
+      .alpha =
+          {
+              .operation = wgpu::BlendOperation::Add,
+              .srcFactor = wgpu::BlendFactor::One,
+              .dstFactor = wgpu::BlendFactor::Zero,
+          },
+  };
+  g_CopyDimPipeline = make_copy_pipeline("XFB Dim Copy Pipeline", "fs_opaque", &constantModulateBlend);
 }
 
 void create_resample_pipeline() {
@@ -1053,6 +1074,7 @@ void shutdown() {
   g_CopyBindGroupLayout = {};
   g_CopyPipeline = {};
   g_CopyPremultipliedAlphaPipeline = {};
+  g_CopyDimPipeline = {};
   g_CopyBindGroup = {};
   g_ResampleBindGroupLayout = {};
   g_ResamplePipeline = {};

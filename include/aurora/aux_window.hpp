@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 #include <webgpu/webgpu_cpp.h>
 
@@ -28,6 +29,21 @@ bool is_open() noexcept;
 /// The view must remain valid through the frame's submission (per-frame pooled
 /// snapshots from gfx::resolve_pass qualify). Call between begin/end frame.
 void set_source(wgpu::TextureView view, uint32_t width, uint32_t height);
+
+/// Darken the auxiliary window at PRESENT time: 0 = untouched, 1 = black.
+/// Applied to the blit, not to the source picture, so the fade keeps running
+/// on frames where set_source is not called (e.g. the companion freezes on its
+/// last frame during a stage load). Callable from any thread.
+void set_dim(float amount);
+
+/// Ask for the next presented aux frame to be copied back to CPU memory.
+/// One-shot: a normal frame costs nothing. Callable from any thread.
+void request_capture();
+
+/// Move the most recent completed capture into `out` (tightly packed RGBA8,
+/// top row first) and clear it. False while none is ready. Callable from any
+/// thread.
+bool take_capture(std::vector<uint8_t>& out, uint32_t* width, uint32_t* height);
 
 /// True once after the user requested closing the auxiliary window.
 bool consume_close_request();

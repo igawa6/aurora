@@ -389,12 +389,30 @@ SDL_JoystickID add_controller(SDL_JoystickID which) noexcept {
       controller.m_deadZones.emulateTriggers = false;
     }
     const auto props = SDL_GetGamepadProperties(ctrl);
-    controller.m_hasRumble = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, true);
+    // Default FALSE, not true. SDL only ever SETS this property when the
+    // capability is actually present (see e.g. ANDROID_JoystickOpen, which
+    // sets it only when the InputDevice reports a vibrator), so an absent
+    // property means "no rumble" -- defaulting it to true asserted rumble on
+    // every device that does not advertise it.
+    //
+    // That broke Android handhelds outright. Their built-in pad enumerates as
+    // a gamepad whose InputDevice has no vibrator: the motor belongs to the
+    // handheld, not to the input device. With m_hasRumble wrongly true,
+    // should_use_device_rumble() stayed false, so PADControlMotor took the
+    // gamepad path into SDL_RumbleGamepad -> ANDROID_JoystickRumble, which
+    // returns SDL_Unsupported() and does nothing -- while the device's own
+    // vibrator, which works, was never reached. With this false, the same
+    // check now routes to aurora::device::rumble() and the handheld buzzes
+    // without the user having to find "Use Device Haptics" first.
+    controller.m_hasRumble = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
     controller.m_hasRgbLed = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RGB_LED_BOOLEAN, false);
     SDL_JoystickID instance = SDL_GetJoystickID(SDL_GetGamepadJoystick(ctrl));
-    Log.info("Added controller '{}' (instance {}, vid {:04x}, pid {:04x}, type {})",
+    // rumble= is logged because "no rumble" bug reports are otherwise
+    // indistinguishable from each other: a pad that never advertised the
+    // capability, and one that did but whose motor does nothing.
+    Log.info("Added controller '{}' (instance {}, vid {:04x}, pid {:04x}, type {}, rumble={})",
              SDL_GetGamepadName(ctrl) != nullptr ? SDL_GetGamepadName(ctrl) : "unknown", instance, controller.m_vid,
-             controller.m_pid, static_cast<int>(SDL_GetGamepadType(ctrl)));
+             controller.m_pid, static_cast<int>(SDL_GetGamepadType(ctrl)), controller.m_hasRumble);
     g_GameControllers[instance] = controller;
     apply_port_preferences();
     return instance;

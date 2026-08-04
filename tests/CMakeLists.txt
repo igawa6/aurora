@@ -110,3 +110,24 @@ target_include_directories(os_alloc_tests PRIVATE
 target_compile_definitions(os_alloc_tests PRIVATE AURORA TARGET_PC)
 target_link_libraries(os_alloc_tests PRIVATE gtest gtest_main fmt::fmt)
 gtest_discover_tests(os_alloc_tests)
+
+# BC decompression: the CPU fallback for GPUs that cannot sample BC (all of
+# Android). Compiles the converter directly, the same way os_alloc_tests does,
+# so the test does not need the renderer or a live device.
+add_executable(texture_convert_tests
+  texture_convert_test.cpp
+  texture_convert_test_globals.cpp
+  ../lib/gfx/texture_convert.cpp
+  ../lib/logging.cpp
+)
+target_include_directories(texture_convert_tests PRIVATE ../include ../lib)
+target_compile_definitions(texture_convert_tests PRIVATE AURORA TARGET_PC AURORA_ENABLE_GX)
+target_link_libraries(texture_convert_tests PRIVATE
+  gtest
+  gtest_main
+  fmt::fmt
+  dawn::webgpu_dawn
+  xxhash
+  TracyClient
+)
+gtest_discover_tests(texture_convert_tests)

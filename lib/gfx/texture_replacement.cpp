@@ -8,6 +8,8 @@
 #include "png_io.hpp"
 #include "texture_convert.hpp"
 
+#include <SDL3/SDL_cpuinfo.h>
+#include <SDL3/SDL_platform_defines.h>
 #include <aurora/texture.hpp>
 #include <fmt/format.h>
 #include <tracy/Tracy.hpp>
@@ -21,7 +23,10 @@
 #include <charconv>
 #include <cstring>
 #include <filesystem>
+#include <condition_variable>
+#include <deque>
 #include <list>
+#include <thread>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -35,7 +40,35 @@ using aurora::webgpu::g_device;
 namespace {
 aurora::Module Log("aurora::texture");
 
-constexpr uint64_t kReplacementCacheBudgetBytes = 4294967296; // 4GB
+// How much GPU memory replacement textures may hold before the LRU starts
+// evicting.
+//
+// This used to be a flat 4 GB, which meant eviction never ran on a phone: the
+// OS kills the process long before a single app reaches 4 GB, so on Android the
+// cache simply grew until the app died. It has to come from the device.
+//
+// A 4x PNG pack costs up to 128x the GPU memory of the GameCube texture it
+// replaces (4 bpp CMPR in, 32 bpp RGBA8 out at 16x the pixels), so the budget
+// is what stands between a large pack and an out-of-memory kill. Android gets a
+// tighter fraction because the figure below is SYSTEM ram, not what one app may
+// have: the per-process limit is a fraction of it, and the GPU shares it.
+uint64_t replacement_cache_budget_bytes() noexcept {
+  static const uint64_t budget = [] {
+    constexpr uint64_t kMiB = 1024ull * 1024ull;
+#if defined(SDL_PLATFORM_ANDROID) || defined(SDL_PLATFORM_IOS)
+    constexpr uint64_t divisor = 12, floorBytes = 128 * kMiB, ceilBytes = 1024 * kMiB;
+#else
+    constexpr uint64_t divisor = 8, floorBytes = 256 * kMiB, ceilBytes = 4096 * kMiB;
+#endif
+    const int ramMiB = SDL_GetSystemRAM();
+    if (ramMiB <= 0) {
+      return floorBytes;  // unknown device: assume the small end
+    }
+    const uint64_t share = (static_cast<uint64_t>(ramMiB) * kMiB) / divisor;
+    return std::clamp(share, floorBytes, ceilBytes);
+  }();
+  return budget;
+}
 constexpr uint64_t kReplacementWildcardTextureHash = aurora::texture::kWildcardTextureHash;
 constexpr uint64_t kReplacementWildcardTlutHash = aurora::texture::kWildcardTlutHash;
 
@@ -85,13 +118,21 @@ struct ReplacementKeyHash {
   }
 };
 
-std::mutex s_registryMutex;
+// The decode workers below outlive orderly shutdown on Android: SDLActivity
+// exits the process, static destructors run, and a worker that wakes up after
+// its mutex has been destroyed aborts the process with FORTIFY's "pthread_mutex_lock
+// called on a destroyed mutex". Binding these to leaked heap objects means the
+// destructors never run, so a late worker finds its state intact instead of
+// taking the process down on the way out. shutdown() still joins them; this is
+// the backstop for the paths that never reach it.
+std::mutex& s_registryMutex = *new std::mutex();
 absl::flat_hash_map<aurora::texture::ReplacementKey, std::vector<ReplacementEntry>, ReplacementKeyHash> s_entriesByKey;
 absl::flat_hash_map<aurora::texture::ReplacementKey, SelectedCache, ReplacementKeyHash> s_cacheByKey;
-absl::flat_hash_set<uint64_t> s_failedIds;
+absl::flat_hash_set<uint64_t>& s_failedIds = *new absl::flat_hash_set<uint64_t>();
 absl::flat_hash_set<aurora::texture::TextureSourceKey, SourceKeyHash> s_reportedMisses;
 std::list<aurora::texture::ReplacementKey> s_replacementLru;
 uint64_t s_replacementCacheBytes = 0;
+
 uint64_t s_nextRegistrationId = 1;
 uint64_t s_nextSequence = 1;
 uint32_t s_sourceEntryCount = 0;
@@ -645,6 +686,27 @@ struct VirtualTextureSource {
   std::optional<aurora::gfx::ConvertedTexture> load_mip() { return decode(); }
 };
 
+// BC is a desktop format; no Android GPU can sample it, so a BC1/BC3 pack used
+// to be rejected file by file and the player got no textures at all. Decode it
+// to RGBA8 instead and carry on. Returns false when there is no decoder for the
+// format (BC5/BC6H/BC7), leaving the caller to reject as before.
+//
+// This makes those packs work, not cheap: the result is uncompressed, so it
+// costs 4-8x the memory the compressed form would have. The cache budget is
+// what keeps that in bounds.
+bool decompress_unsupported_bc(aurora::gfx::ConvertedTexture& texture, std::string_view label) noexcept {
+  auto rgba = aurora::gfx::decompress_bc_to_rgba8(texture.format, texture.width, texture.height, texture.mips,
+                                                  {texture.data.data(), texture.data.size()});
+  if (rgba.empty()) {
+    return false;
+  }
+  Log.info("texture_replacement: decoded {} from BC {} to RGBA8 (this GPU cannot sample BC)", label,
+           static_cast<uint32_t>(texture.format));
+  texture.format = wgpu::TextureFormat::RGBA8Unorm;
+  texture.data = std::move(rgba);
+  return true;
+}
+
 template <typename Source>
 std::optional<aurora::gfx::ConvertedTexture> load_encoded_replacement(Source&& src) noexcept {
   auto base = src.load_base();
@@ -652,7 +714,7 @@ std::optional<aurora::gfx::ConvertedTexture> load_encoded_replacement(Source&& s
     Log.warn("texture_replacement: failed to load texture {}", src.name());
     return std::nullopt;
   }
-  if (is_unsupported_texture_format(base->format)) {
+  if (is_unsupported_texture_format(base->format) && !decompress_unsupported_bc(*base, src.name())) {
     Log.warn("texture_replacement: failed to load texture {} due to unsupported format: {}", src.name(),
              static_cast<uint32_t>(base->format));
     return std::nullopt;
@@ -747,10 +809,12 @@ std::string entry_path_for_log(const ReplacementEntry& entry) {
   return entry.kind == EntryKind::Virtual ? entry.virtualPath : fs_path_to_string(entry.path);
 }
 
-aurora::gfx::TextureHandle create_converted_texture_handle(const aurora::texture::ReplacementKey& key,
-                                                           const ReplacementEntry& entry,
-                                                           const aurora::gfx::ConvertedTexture& replacement) noexcept {
-  const auto label = entry.label.empty() ? fmt::format("TextureReplacement {}", entry.id) : entry.label;
+// Takes the label and id by value rather than the entry by reference: the
+// caller releases the registry lock around this, and the entry it came from can
+// be unregistered while the upload is in flight.
+aurora::gfx::TextureHandle create_converted_texture_handle_unlocked(
+    uint64_t entryId, const std::string& entryLabel, const aurora::gfx::ConvertedTexture& replacement) noexcept {
+  const auto label = entryLabel.empty() ? fmt::format("TextureReplacement {}", entryId) : entryLabel;
   const wgpu::Extent3D size{
       .width = replacement.width,
       .height = replacement.height,
@@ -780,6 +844,12 @@ aurora::gfx::TextureHandle create_converted_texture_handle(const aurora::texture
   handle->isReplacement = true;
   aurora::gfx::write_texture(*handle, replacement.data);
   return handle;
+}
+
+aurora::gfx::TextureHandle create_converted_texture_handle(const aurora::texture::ReplacementKey& key,
+                                                           const ReplacementEntry& entry,
+                                                           const aurora::gfx::ConvertedTexture& replacement) noexcept {
+  return create_converted_texture_handle_unlocked(entry.id, entry.label, replacement);
 }
 
 aurora::gfx::TextureHandle create_raw_texture_handle(const ReplacementEntry& entry) noexcept {
@@ -826,10 +896,23 @@ void touch_cached_replacement(decltype(s_cacheByKey)::iterator it) noexcept {
 }
 
 void evict_replacement_cache_if_needed() noexcept {
-  while (s_replacementCacheBytes > kReplacementCacheBudgetBytes && !s_replacementLru.empty()) {
+  const uint64_t budget = replacement_cache_budget_bytes();
+  while (s_replacementCacheBytes > budget && !s_replacementLru.empty()) {
     const auto key = s_replacementLru.back();
     erase_cache_locked(key);
   }
+}
+
+// Everything the LRU is holding, dropped. Called when the OS says it is about
+// to start killing processes, so half measures are not worth the risk — an
+// evicted replacement costs one reload, a kill costs the session.
+//
+// Safe to run mid-frame: TextureHandle is a shared_ptr, so anything already
+// bound this frame stays alive until the frame that bound it is done with it.
+void drop_replacement_cache_locked() noexcept {
+  s_cacheByKey.clear();
+  s_replacementLru.clear();
+  s_replacementCacheBytes = 0;
 }
 
 const ReplacementEntry* select_entry(const std::vector<ReplacementEntry>& entries) noexcept {
@@ -877,6 +960,109 @@ find_source_replacement_key_locked(const aurora::texture::TextureSourceKey& key)
   return std::nullopt;
 }
 
+// ---------------------------------------------------------------------------
+// Background decoding
+//
+// Reading and decoding a replacement used to happen inline, inside the frame,
+// with s_registryMutex held throughout. A single 1024x2048 PNG measured 139 ms
+// that way — eight dropped frames — and a room's worth of first-sighted
+// textures produced dozens of those in a row, which is why texture packs
+// stuttered hardest exactly where the most new textures appear: entering an
+// area, cutscenes, the intro.
+//
+// So the file read and the image decode move to worker threads and the frame
+// path only does the GPU upload, which is cheap. Until a replacement is ready
+// the game's own texture is drawn, so replacements now fade in over the first
+// moments of a scene rather than freezing it.
+//
+// Only File entries go async. Virtual entries read through a mod-supplied
+// callback whose lifetime we do not control, so decoding one on a worker could
+// outlive the source that owns the bytes; Raw entries are already in memory and
+// have nothing to wait for.
+
+struct DecodeJob {
+  aurora::texture::ReplacementKey key;
+  uint64_t entryId = 0;
+  std::filesystem::path path;
+};
+
+std::deque<DecodeJob>& s_decodeQueue = *new std::deque<DecodeJob>();
+absl::flat_hash_map<aurora::texture::ReplacementKey, aurora::gfx::ConvertedTexture, ReplacementKeyHash>&
+    s_decodedByKey =
+        *new absl::flat_hash_map<aurora::texture::ReplacementKey, aurora::gfx::ConvertedTexture, ReplacementKeyHash>();
+absl::flat_hash_map<aurora::texture::ReplacementKey, uint64_t, ReplacementKeyHash>& s_decodedEntryId =
+    *new absl::flat_hash_map<aurora::texture::ReplacementKey, uint64_t, ReplacementKeyHash>();
+absl::flat_hash_set<aurora::texture::ReplacementKey, ReplacementKeyHash>& s_pendingKeys =
+    *new absl::flat_hash_set<aurora::texture::ReplacementKey, ReplacementKeyHash>();
+std::condition_variable& s_decodeCv = *new std::condition_variable();
+std::vector<std::thread>& s_decodeThreads = *new std::vector<std::thread>();
+bool s_decodeShutdown = false;
+
+// Guarded by s_registryMutex, the same lock the registry uses — a second mutex
+// would need an ordering rule between them, and the queue operations are all
+// map-sized. The workers release it across the file read and decode, which is
+// the entire point of this.
+void decode_worker_main() {
+  std::unique_lock lk(s_registryMutex);
+  while (true) {
+    if (s_decodeShutdown) {
+      return;
+    }
+    if (s_decodeQueue.empty()) {
+      s_decodeCv.wait(lk);
+      continue;
+    }
+    auto job = std::move(s_decodeQueue.front());
+    s_decodeQueue.pop_front();
+
+    lk.unlock();
+    auto decoded = load_encoded_replacement(FileTextureSource{.path = job.path});
+    lk.lock();
+
+    // The registry can have been reloaded or cleared while we were reading;
+    // publishing a texture for an entry that no longer exists would resurrect
+    // a replacement the user just turned off.
+    if (s_pendingKeys.erase(job.key) != 0) {
+      if (decoded.has_value()) {
+        s_decodedByKey.insert_or_assign(job.key, std::move(*decoded));
+        s_decodedEntryId.insert_or_assign(job.key, job.entryId);
+      } else {
+        s_failedIds.insert(job.entryId);
+      }
+    }
+  }
+}
+
+void start_decode_threads_locked() {
+  if (!s_decodeThreads.empty() || s_decodeShutdown) {
+    return;
+  }
+  // Two is enough to keep the queue moving without competing with the game for
+  // cores; decoding is CPU-bound and the frame thread matters more than
+  // draining fast.
+  const unsigned hw = std::thread::hardware_concurrency();
+  const unsigned count = hw >= 4 ? 2u : 1u;
+  for (unsigned i = 0; i < count; ++i) {
+    s_decodeThreads.emplace_back(decode_worker_main);
+  }
+}
+
+void stop_decode_threads() {
+  std::vector<std::thread> threads;
+  {
+    std::unique_lock lk(s_registryMutex);
+    s_decodeShutdown = true;
+    s_decodeQueue.clear();
+    s_decodeCv.notify_all();
+    threads.swap(s_decodeThreads);
+  }
+  for (auto& thread : threads) {
+    if (thread.joinable()) {
+      thread.join();
+    }
+  }
+}
+
 aurora::gfx::TextureHandle load_entry_handle(const aurora::texture::ReplacementKey& key,
                                              const ReplacementEntry& entry) noexcept {
   if (s_failedIds.contains(entry.id)) {
@@ -884,9 +1070,8 @@ aurora::gfx::TextureHandle load_entry_handle(const aurora::texture::ReplacementK
   }
 
   aurora::gfx::TextureHandle handle;
-  if (entry.kind == EntryKind::File || entry.kind == EntryKind::Virtual) {
-    const auto replacement =
-        entry.kind == EntryKind::File ? load_file_replacement(entry) : load_virtual_replacement(entry);
+  if (entry.kind == EntryKind::Virtual) {
+    const auto replacement = load_virtual_replacement(entry);
     if (!replacement.has_value()) {
       s_failedIds.insert(entry.id);
       return {};
@@ -902,8 +1087,14 @@ aurora::gfx::TextureHandle load_entry_handle(const aurora::texture::ReplacementK
   return handle;
 }
 
-std::optional<aurora::gfx::TextureHandle>
-find_replacement_for_key_locked(const aurora::texture::ReplacementKey& key) noexcept {
+// Returns the handle if one is ready, and reports through `pending` whether a
+// decode is in flight. The caller must not cache the game's own texture against
+// its texture object while pending is true: that cache is keyed by texObjId and
+// checked before we are ever consulted, so caching the fallback would pin it
+// there and the replacement would never appear for that object.
+std::optional<aurora::gfx::TextureHandle> find_replacement_for_key_locked(std::unique_lock<std::mutex>& lk,
+                                                                          const aurora::texture::ReplacementKey& key,
+                                                                          bool* pending) noexcept {
   const auto* entry = find_selected_entry_locked(key);
   if (entry == nullptr) {
     return std::nullopt;
@@ -914,8 +1105,57 @@ find_replacement_for_key_locked(const aurora::texture::ReplacementKey& key) noex
     return cache->second.handle;
   }
 
-  erase_cache_locked(key);
-  auto handle = load_entry_handle(key, *entry);
+  aurora::gfx::TextureHandle handle;
+  if (const auto decoded = s_decodedByKey.find(key); decoded != s_decodedByKey.end()) {
+    // A worker finished this one. All that is left is the GPU upload, which is
+    // the only part that has to happen on this thread.
+    const auto idIt = s_decodedEntryId.find(key);
+    const bool stale = idIt == s_decodedEntryId.end() || idIt->second != entry->id;
+    aurora::gfx::ConvertedTexture texture = std::move(decoded->second);
+    s_decodedByKey.erase(decoded);
+    s_decodedEntryId.erase(key);
+    if (stale) {
+      return std::nullopt;  // registry changed under the job; ask again next frame
+    }
+    erase_cache_locked(key);
+    // The GPU upload runs with the registry lock RELEASED. Held, it serialises
+    // against every other lookup and against the decode workers publishing
+    // their results, and a texture upload is long enough for that to cost more
+    // than the inline load ever did — measured 56% of wall clock blocked in
+    // lookups versus 16% before, until this unlock was added.
+    const uint64_t entryId = entry->id;
+    const std::string label = entry->label;
+    lk.unlock();
+    handle = create_converted_texture_handle_unlocked(entryId, label, texture);
+    lk.lock();
+    // Anything could have changed while we were unlocked: the entry could have
+    // been unregistered, or another thread could have cached this same key.
+    const auto* current = find_selected_entry_locked(key);
+    if (current == nullptr || current->id != entryId) {
+      return std::nullopt;
+    }
+    if (const auto cached = s_cacheByKey.find(key); cached != s_cacheByKey.end()) {
+      touch_cached_replacement(cached);
+      return cached->second.handle;  // someone else won the race; keep theirs
+    }
+  } else if (entry->kind == EntryKind::File) {
+    if (s_failedIds.contains(entry->id)) {
+      return std::nullopt;
+    }
+    if (s_pendingKeys.insert(key).second) {
+      start_decode_threads_locked();
+      s_decodeQueue.push_back(DecodeJob{.key = key, .entryId = entry->id, .path = entry->path});
+      s_decodeCv.notify_one();
+    }
+    if (pending != nullptr) {
+      *pending = true;
+    }
+    return std::nullopt;  // the game's own texture is drawn until this lands
+  } else {
+    erase_cache_locked(key);
+    handle = load_entry_handle(key, *entry);
+  }
+
   if (!handle) {
     return std::nullopt;
   }
@@ -1018,6 +1258,14 @@ void clear_replacement_runtime_state_locked() noexcept {
   s_replacementLru.clear();
   s_replacementCacheBytes = 0;
   s_sourceEntryCount = 0;
+  // Abandon background work rather than waiting for it. A job still reading
+  // holds its own copy of the path, so it cannot dangle; it will find its key
+  // gone from s_pendingKeys and throw its result away. Registration ids are
+  // never reused, so a late publish can never be mistaken for a new entry.
+  s_decodeQueue.clear();
+  s_pendingKeys.clear();
+  s_decodedByKey.clear();
+  s_decodedEntryId.clear();
 }
 
 bool is_source_key(const aurora::texture::ReplacementKey& key) noexcept {
@@ -1262,12 +1510,54 @@ bool has_replacement(const GXTexObj* obj, const GXTlutObj* tlut) {
 } // namespace aurora::texture
 
 namespace aurora::gfx::texture_replacement {
+// Hash once, reuse until the caller says the texture changed.
+aurora::texture::TextureSourceKey cached_or_build_source_key(SourceKeyCache* cache,
+                                                             const GXTexObj_& obj) noexcept {
+  if (cache != nullptr && cache->valid) {
+    return cache->key;
+  }
+  const auto key = build_source_key(obj);
+  if (cache != nullptr) {
+    cache->key = key;
+    cache->valid = true;
+  }
+  return key;
+}
+
+aurora::texture::TextureSourceKey cached_or_build_source_key(SourceKeyCache* cache, const GXTexObj_& obj,
+                                                             const GXTlutObj_& tlut) noexcept {
+  if (cache != nullptr && cache->valid) {
+    return cache->key;
+  }
+  const auto key = build_source_key(obj, tlut);
+  if (cache != nullptr) {
+    cache->key = key;
+    cache->valid = true;
+  }
+  return key;
+}
+
 void initialize() noexcept {}
 
-void shutdown() noexcept { texture::clear_replacements(); }
+void shutdown() noexcept {
+  stop_decode_threads();  // join before the registry the workers read goes away
+  texture::clear_replacements();
+}
 
-std::optional<TextureHandle> find_source_replacement_locked(const GXTexObj_& obj,
-                                                            const texture::TextureSourceKey& sourceKey) noexcept {
+void on_low_memory() noexcept {
+  std::lock_guard lk(s_registryMutex);
+  const uint64_t freed = s_replacementCacheBytes;
+  const size_t count = s_cacheByKey.size();
+  drop_replacement_cache_locked();
+  if (count != 0) {
+    Log.warn("texture_replacement: low memory, dropped {} cached replacement(s) ({:.1f} MB)", count,
+             static_cast<double>(freed) / (1024.0 * 1024.0));
+  }
+}
+
+std::optional<TextureHandle> find_source_replacement_locked(std::unique_lock<std::mutex>& lk, const GXTexObj_& obj,
+                                                            const texture::TextureSourceKey& sourceKey,
+                                                            bool* pending) noexcept {
   const auto replacementKey = find_source_replacement_key_locked(sourceKey);
   if (!replacementKey.has_value()) {
     const bool alwaysReportMissingKey = false; // Enable for debugging
@@ -1277,13 +1567,14 @@ std::optional<TextureHandle> find_source_replacement_locked(const GXTexObj_& obj
     return std::nullopt;
   }
 
-  return find_replacement_for_key_locked(*replacementKey);
+  return find_replacement_for_key_locked(lk, *replacementKey, pending);
 }
 
-std::optional<TextureHandle> find_replacement(const GXTexObj_& obj) noexcept {
+std::optional<TextureHandle> find_replacement(const GXTexObj_& obj, bool* pending,
+                                             SourceKeyCache* keyCache) noexcept {
   ZoneScoped;
 
-  std::lock_guard lk(s_registryMutex);
+  std::unique_lock lk(s_registryMutex);
   if (s_entriesByKey.empty() && !g_config.allowTextureDumps) {
     return std::nullopt;
   }
@@ -1291,7 +1582,7 @@ std::optional<TextureHandle> find_replacement(const GXTexObj_& obj) noexcept {
   if (obj.data != nullptr) {
     texture::ReplacementKey pointerKey{texture::TexturePointerKey{.data = obj.data}};
     if (s_entriesByKey.contains(pointerKey)) {
-      return find_replacement_for_key_locked(pointerKey);
+      return find_replacement_for_key_locked(lk, pointerKey, pending);
     }
   }
 
@@ -1299,14 +1590,15 @@ std::optional<TextureHandle> find_replacement(const GXTexObj_& obj) noexcept {
     return std::nullopt;
   }
 
-  const auto sourceKey = build_source_key(obj);
-  return find_source_replacement_locked(obj, sourceKey);
+  const auto sourceKey = cached_or_build_source_key(keyCache, obj);
+  return find_source_replacement_locked(lk, obj, sourceKey, pending);
 }
 
-std::optional<TextureHandle> find_replacement(const GXTexObj_& obj, const GXTlutObj_& tlut) noexcept {
+std::optional<TextureHandle> find_replacement(const GXTexObj_& obj, const GXTlutObj_& tlut,
+                                             bool* pending, SourceKeyCache* keyCache) noexcept {
   ZoneScoped;
 
-  std::lock_guard lk(s_registryMutex);
+  std::unique_lock lk(s_registryMutex);
   if (s_entriesByKey.empty() && !g_config.allowTextureDumps) {
     return std::nullopt;
   }
@@ -1314,7 +1606,7 @@ std::optional<TextureHandle> find_replacement(const GXTexObj_& obj, const GXTlut
   if (obj.data != nullptr) {
     texture::ReplacementKey pointerKey{texture::TexturePointerKey{.data = obj.data}};
     if (s_entriesByKey.contains(pointerKey)) {
-      return find_replacement_for_key_locked(pointerKey);
+      return find_replacement_for_key_locked(lk, pointerKey, pending);
     }
   }
 
@@ -1322,8 +1614,8 @@ std::optional<TextureHandle> find_replacement(const GXTexObj_& obj, const GXTlut
     return std::nullopt;
   }
 
-  const auto sourceKey = build_source_key(obj, tlut);
-  return find_source_replacement_locked(obj, sourceKey);
+  const auto sourceKey = cached_or_build_source_key(keyCache, obj, tlut);
+  return find_source_replacement_locked(lk, obj, sourceKey, pending);
 }
 
 bool has_replacement(const GXTexObj_& obj) noexcept {

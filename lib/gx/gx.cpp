@@ -67,6 +67,17 @@ struct CachedTextureEntry {
   u32 texDataVersion = 0;
   u32 tlutObjId = 0;
   u32 tlutDataVersion = 0;
+  // The handle is the game's own texture, standing in while a replacement
+  // decodes on a worker. The entry is still cached — rebuilding the fallback
+  // every frame costs a full convert and GPU upload per texture, which is far
+  // worse than the stall we are removing — but it is re-queried each frame so
+  // the replacement can be swapped in the moment it lands.
+  bool replacementPending = false;
+  // The key that re-query would otherwise rebuild by hashing the whole base
+  // level every frame. Valid only while texDataVersion (and, for palette
+  // textures, tlutDataVersion) are unchanged, which every read below checks
+  // before touching it.
+  gfx::texture_replacement::SourceKeyCache sourceKey;
 };
 
 struct CachedTlutTextureEntry {
@@ -113,7 +124,9 @@ void clear_texture_dependency(u32 texObjId, u32 tlutObjId) {
   }
 }
 
-void store_cached_texture(const GXTexObj_& obj, gfx::TextureHandle handle, u32 tlutObjId = 0, u32 tlutDataVersion = 0) {
+void store_cached_texture(const GXTexObj_& obj, gfx::TextureHandle handle, u32 tlutObjId = 0,
+                          u32 tlutDataVersion = 0, bool replacementPending = false,
+                          const gfx::texture_replacement::SourceKeyCache& sourceKey = {}) {
   if (obj.texObjId == 0) {
     return;
   }
@@ -127,6 +140,8 @@ void store_cached_texture(const GXTexObj_& obj, gfx::TextureHandle handle, u32 t
   entry.texDataVersion = obj.texDataVersion;
   entry.tlutObjId = tlutObjId;
   entry.tlutDataVersion = tlutDataVersion;
+  entry.replacementPending = replacementPending;
+  entry.sourceKey = sourceKey;
 
   if (tlutObjId != 0) {
     s_tlutObjectCaches[tlutObjId].staticTextureUsers.insert(obj.texObjId);
@@ -165,15 +180,37 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
 
   if (obj.texObjId != 0) {
     if (const auto it = s_textureObjectCaches.find(obj.texObjId); it != s_textureObjectCaches.end()) {
-      const auto& entry = it->second;
+      auto& entry = it->second;
       if (entry.handle && entry.texDataVersion == obj.texDataVersion && entry.tlutObjId == 0) {
+        if (!entry.replacementPending) {
+          return entry.handle;
+        }
+        // Cheap: map lookups only — the source key was hashed once when this
+        // entry was stored and is reused until the texture data changes.
+        bool stillPending = false;
+        if (const auto replacement =
+                gfx::texture_replacement::find_replacement(obj, &stillPending, &entry.sourceKey);
+            replacement.has_value()) {
+          entry.handle = *replacement;
+          entry.replacementPending = false;
+        } else {
+          entry.replacementPending = stillPending;
+        }
         return entry.handle;
       }
     }
   }
 
   gfx::TextureHandle handle;
-  if (const auto replacement = gfx::texture_replacement::find_replacement(obj); replacement.has_value()) {
+  // A replacement being decoded in the background means "not yet", not "none".
+  // Caching the game's own texture against this texObjId while that is true
+  // would pin the fallback: the cache above is consulted before we ever ask
+  // again, so the replacement would land and never be picked up.
+  bool replacementPending = false;
+  gfx::texture_replacement::SourceKeyCache sourceKey;
+  if (const auto replacement =
+          gfx::texture_replacement::find_replacement(obj, &replacementPending, &sourceKey);
+      replacement.has_value()) {
     handle = *replacement;
   } else {
 #if DEBUG
@@ -186,7 +223,7 @@ gfx::TextureHandle resolve_static_texture(const GXTexObj_& obj) {
                                         {static_cast<const uint8_t*>(obj.data), UINT32_MAX}, false, nameStr);
   }
   if (!obj.no_cache()) {
-    store_cached_texture(obj, handle);
+    store_cached_texture(obj, handle, 0, 0, replacementPending, sourceKey);
   }
   return handle;
 }
@@ -199,16 +236,34 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
 
   if (obj.texObjId != 0) {
     if (const auto it = s_textureObjectCaches.find(obj.texObjId); it != s_textureObjectCaches.end()) {
-      const auto& entry = it->second;
+      auto& entry = it->second;
       if (entry.handle && entry.texDataVersion == obj.texDataVersion && entry.tlutObjId == tlut.tlutObjId &&
           entry.tlutDataVersion == tlut.tlutDataVersion) {
+        if (!entry.replacementPending) {
+          return entry.handle;
+        }
+        // Reuses the stored key: both texDataVersion and tlutDataVersion are
+        // checked above, so it still describes this texture.
+        bool stillPending = false;
+        if (const auto replacement = gfx::texture_replacement::find_replacement(
+                obj, tlut, &stillPending, &entry.sourceKey);
+            replacement.has_value()) {
+          entry.handle = *replacement;
+          entry.replacementPending = false;
+        } else {
+          entry.replacementPending = stillPending;
+        }
         return entry.handle;
       }
     }
   }
 
   gfx::TextureHandle handle;
-  if (const auto replacement = gfx::texture_replacement::find_replacement(obj, tlut); replacement.has_value()) {
+  bool replacementPending = false;
+  gfx::texture_replacement::SourceKeyCache sourceKey;
+  if (const auto replacement =
+          gfx::texture_replacement::find_replacement(obj, tlut, &replacementPending, &sourceKey);
+      replacement.has_value()) {
     handle = *replacement;
   } else {
     auto converted = gfx::convert_texture_palette(
@@ -223,7 +278,8 @@ gfx::TextureHandle resolve_static_palette_texture(const GXTexObj_& obj, const GX
     handle->hasArbitraryMips = converted.hasArbitraryMips;
   }
   if (!obj.no_cache() && !tlut.no_cache()) {
-    store_cached_texture(obj, handle, tlut.tlutObjId, tlut.tlutDataVersion);
+    store_cached_texture(obj, handle, tlut.tlutObjId, tlut.tlutDataVersion, replacementPending,
+                         sourceKey);
   }
   return handle;
 }

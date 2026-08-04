@@ -4,6 +4,7 @@
 #include "aux_window.hpp"
 #include "imgui.hpp"
 #include "webgpu/gpu.hpp"
+#include "gfx/texture_replacement.hpp"
 #endif
 #include "input.hpp"
 #include "internal.hpp"
@@ -124,6 +125,19 @@ bool SDLCALL lifecycle_event_watch(void*, SDL_Event* event) {
     break;
   case SDL_EVENT_WINDOW_RESTORED:
     g_backgrounded.store(false, std::memory_order_relaxed);
+    break;
+#endif
+#ifdef AURORA_ENABLE_GX
+  case SDL_EVENT_LOW_MEMORY:
+    // Handled inline rather than deferred to the next frame on purpose: this
+    // arrives from onTrimMemory, which fires hardest while the app is
+    // BACKGROUNDED and drawing nothing, so a frame-boundary hook would hand the
+    // memory back only after the process had already survived — or not.
+    //
+    // Safe off the render thread: the cache holds shared_ptrs to plain Dawn
+    // handles, so releasing them is an atomic refcount drop, and the registry
+    // mutex serialises the maps against the frame path.
+    gfx::texture_replacement::on_low_memory();
     break;
 #endif
   default:

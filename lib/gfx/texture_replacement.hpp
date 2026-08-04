@@ -17,6 +17,12 @@ struct StreamingStats {
 };
 
 void shutdown() noexcept;
+/// Drop every cached replacement texture. Wired to SDL_EVENT_LOW_MEMORY: the
+/// replacement cache is by far the largest discretionary allocation the process
+/// holds, so it is the first thing to give back when the OS is under pressure.
+/// Costs a reload of whatever is still on screen; the alternative is being
+/// killed.
+void on_low_memory() noexcept;
 StreamingStats process_streaming() noexcept;
 std::optional<ReplacementResult> find_pointer_replacement(const GXTexObj_& obj) noexcept;
 std::optional<ReplacementResult> find_source_replacement(const GXTexObj_& obj,

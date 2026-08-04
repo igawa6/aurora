@@ -10,6 +10,8 @@
 #include "png_io.hpp"
 #include "texture_convert.hpp"
 
+#include <SDL3/SDL_cpuinfo.h>
+#include <SDL3/SDL_platform_defines.h>
 #include <aurora/texture.hpp>
 #include <fmt/format.h>
 #include <tracy/Tracy.hpp>
@@ -42,7 +44,35 @@ namespace aurora::texture {
 namespace {
 constexpr Module Log{"aurora::texture"};
 
-constexpr uint64_t kReplacementCacheBudgetBytes = 4294967296; // 4GB
+// How much GPU memory replacement textures may hold before the LRU starts
+// evicting.
+//
+// This used to be a flat 4 GB, which meant eviction never ran on a phone: the
+// OS kills the process long before a single app reaches 4 GB, so on Android the
+// cache simply grew until the app died. It has to come from the device.
+//
+// A 4x PNG pack costs up to 128x the GPU memory of the GameCube texture it
+// replaces (4 bpp CMPR in, 32 bpp RGBA8 out at 16x the pixels), so the budget
+// is what stands between a large pack and an out-of-memory kill. Android gets a
+// tighter fraction because the figure below is SYSTEM ram, not what one app may
+// have: the per-process limit is a fraction of it, and the GPU shares it.
+uint64_t replacement_cache_budget_bytes() noexcept {
+  static const uint64_t budget = [] {
+    constexpr uint64_t kMiB = 1024ull * 1024ull;
+#if defined(SDL_PLATFORM_ANDROID) || defined(SDL_PLATFORM_IOS)
+    constexpr uint64_t divisor = 12, floorBytes = 128 * kMiB, ceilBytes = 1024 * kMiB;
+#else
+    constexpr uint64_t divisor = 8, floorBytes = 256 * kMiB, ceilBytes = 4096 * kMiB;
+#endif
+    const int ramMiB = SDL_GetSystemRAM();
+    if (ramMiB <= 0) {
+      return floorBytes; // unknown device: assume the small end
+    }
+    const uint64_t share = (static_cast<uint64_t>(ramMiB) * kMiB) / divisor;
+    return std::clamp(share, floorBytes, ceilBytes);
+  }();
+  return budget;
+}
 constexpr uint64_t kReplacementWildcardTextureHash = kWildcardTextureHash;
 constexpr uint64_t kReplacementWildcardTlutHash = kWildcardTlutHash;
 
@@ -639,6 +669,27 @@ struct VirtualTextureSource {
   std::optional<gfx::ConvertedTexture> load_mip() { return decode(); }
 };
 
+// BC is a desktop format; no Android GPU can sample it, so a BC1/BC3 pack used
+// to be rejected file by file and the player got no textures at all. Decode it
+// to RGBA8 instead and carry on. Returns false when there is no decoder for the
+// format (BC5/BC6H/BC7), leaving the caller to reject as before.
+//
+// This makes those packs work, not cheap: the result is uncompressed, so it
+// costs 4-8x the memory the compressed form would have. The cache budget is
+// what keeps that in bounds.
+bool decompress_unsupported_bc(gfx::ConvertedTexture& texture, std::string_view label) noexcept {
+  auto rgba = gfx::decompress_bc_to_rgba8(texture.format, texture.width, texture.height, texture.mips,
+                                          {texture.data.data(), texture.data.size()});
+  if (rgba.empty()) {
+    return false;
+  }
+  Log.info("texture_replacement: decoded {} from BC {} to RGBA8 (this GPU cannot sample BC)", label,
+           static_cast<uint32_t>(texture.format));
+  texture.format = wgpu::TextureFormat::RGBA8Unorm;
+  texture.data = std::move(rgba);
+  return true;
+}
+
 template <typename Source>
 std::optional<gfx::ConvertedTexture> load_encoded_replacement(Source&& src) noexcept {
   auto base = src.load_base();
@@ -646,7 +697,7 @@ std::optional<gfx::ConvertedTexture> load_encoded_replacement(Source&& src) noex
     Log.warn("texture_replacement: failed to load texture {}", src.name());
     return std::nullopt;
   }
-  if (is_unsupported_texture_format(base->format)) {
+  if (is_unsupported_texture_format(base->format) && !decompress_unsupported_bc(*base, src.name())) {
     Log.warn("texture_replacement: failed to load texture {} due to unsupported format: {}", src.name(),
              static_cast<uint32_t>(base->format));
     return std::nullopt;
@@ -1046,7 +1097,7 @@ void touch_cached_replacement(decltype(s_cacheByKey)::iterator it) noexcept {
 }
 
 void evict_replacement_cache_if_needed() noexcept {
-  while (s_replacementCacheBytes > kReplacementCacheBudgetBytes && !s_replacementLru.empty()) {
+  while (s_replacementCacheBytes > replacement_cache_budget_bytes() && !s_replacementLru.empty()) {
     const auto key = s_replacementLru.back();
     const auto cache = s_cacheByKey.find(key);
     const uint64_t id = cache == s_cacheByKey.end() ? 0 : cache->second.id;
@@ -1717,6 +1768,8 @@ void shutdown() noexcept {
   clear_replacements();
   stop_worker_pool();
 }
+
+void on_low_memory() noexcept { clear_replacements(); }
 
 StreamingStats process_streaming() noexcept {
   if constexpr (!gx::texture::AsyncTextureReplacements) {

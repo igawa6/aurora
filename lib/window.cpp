@@ -566,4 +566,13 @@ extern "C" JNIEXPORT void JNICALL Java_dev_encounter_aurora_AuroraSurface_native
                                                                                                 jboolean ready) {
   aurora::window::set_surface_ready(ready == JNI_TRUE);
 }
+
+// Compatibility export for embedders whose Android glue still declares this on
+// a patched org.libsdl.app.SDLSurface, which is where this callback lived
+// before it moved to dev.encounter.aurora.AuroraSurface. Same target; without
+// it those builds die at surfaceCreated with an UnsatisfiedLinkError.
+extern "C" JNIEXPORT void JNICALL Java_org_libsdl_app_SDLSurface_auroraNativeSetSurfaceReady(JNIEnv*, jclass,
+                                                                                             jboolean ready) {
+  aurora::window::set_surface_ready(ready == JNI_TRUE);
+}
 #endif

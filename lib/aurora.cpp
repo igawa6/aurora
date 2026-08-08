@@ -5,6 +5,7 @@
 #include "gfx/common.hpp"
 #include "gfx/render_worker.hpp"
 #include "gx/fifo.hpp"
+#include "gx/texture.hpp"
 #include "imgui.hpp"
 #include "webgpu/gpu.hpp"
 #include "webgpu/gpu_prof.hpp"
@@ -120,11 +121,11 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
   if (g_config.maxTextureAnisotropy == 0) {
     g_config.maxTextureAnisotropy = 16;
   }
-  ASSERT(window::initialize(), "Error initializing window");
+  AURORA_ASSERT(window::initialize(), "Error initializing window");
 
   g_sdlCustomEventsStart = SDL_RegisterEvents(2);
-  ASSERT(g_sdlCustomEventsStart, "Failed to allocate user events: {}", SDL_GetError());
-  ASSERT(window::initialize_event_watch(), "Error initializing SDL event watch");
+  AURORA_ASSERT(g_sdlCustomEventsStart, "Failed to allocate user events: {}", SDL_GetError());
+  AURORA_ASSERT(window::initialize_event_watch(), "Error initializing SDL event watch");
 
 #ifdef AURORA_ENABLE_GX
   /* Attempt to create a window using the calling application's desired backend */
@@ -153,16 +154,16 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
     }
   }
 
-  ASSERT(windowCreated, "Error creating window: {}", SDL_GetError());
+  AURORA_ASSERT(windowCreated, "Error creating window: {}", SDL_GetError());
 
   // Initialize SDL_Renderer for ImGui when we can't use a Dawn backend
   if (webgpu::g_backendType == wgpu::BackendType::Null) {
-    ASSERT(window::create_renderer(), "Failed to initialize SDL renderer: {}", SDL_GetError());
+    AURORA_ASSERT(window::create_renderer(), "Failed to initialize SDL renderer: {}", SDL_GetError());
   }
 #else
   AuroraBackend selectedBackend = BACKEND_NULL;
-  ASSERT(window::create_window(BACKEND_NULL), "Error creating window: {}", SDL_GetError());
-  ASSERT(window::create_renderer(), "Failed to initialize SDL renderer: {}", SDL_GetError());
+  AURORA_ASSERT(window::create_window(BACKEND_NULL), "Error creating window: {}", SDL_GetError());
+  AURORA_ASSERT(window::create_renderer(), "Failed to initialize SDL renderer: {}", SDL_GetError());
 #endif
 
   window::show_window();
@@ -249,6 +250,7 @@ bool begin_frame() noexcept {
 void end_frame() noexcept {
   ZoneScoped;
 #ifdef AURORA_ENABLE_GX
+  gx::texture::end_frame();
   gx::fifo::drain();
   gfx::finish();
   auto imguiDrawData = imgui::freeze();
@@ -269,7 +271,8 @@ void end_frame() noexcept {
 #endif
 
   gfx::end_frame([rmlBindGroup = std::move(rmlBindGroup), rmlOverlay, viewport,
-                  imguiDrawData = std::move(imguiDrawData)](wgpu::CommandEncoder& encoder) {
+                  imguiDrawData = std::move(imguiDrawData)](
+                     wgpu::CommandEncoder& encoder, std::vector<gfx::AfterSubmitCallback> afterSubmitCallbacks) {
     wgpu::Texture currentTexture;
     wgpu::TextureView currentView;
     auto surfaceStatus = wgpu::SurfaceGetCurrentTextureStatus::Error;
@@ -399,6 +402,11 @@ void end_frame() noexcept {
           Log.error("Failed to get surface texture: {}", magic_enum::enum_name(surfaceStatus));
         }
         break;
+      }
+    }
+    for (auto& callback : afterSubmitCallbacks) {
+      if (callback) {
+        callback();
       }
     }
     gfx::after_submit();

@@ -143,6 +143,7 @@ struct RuntimeEncoderTaskType {
   std::string label;
   EncoderTaskCallback callback = nullptr;
   void* userdata = nullptr;
+  EncoderTaskCompletionCallback afterSubmit = nullptr;
   uint32_t generation = 1;
 };
 
@@ -302,6 +303,7 @@ struct FramePacket {
   ByteBuffer storage;
   ByteBuffer textureUpload;
   wgpu::CommandEncoder encoder;
+  std::vector<AfterSubmitCallback> afterSubmitCallbacks;
   uint64_t frameId = 0;
   uint32_t frameIndex = 0;
   size_t stagingBuffer = 0;
@@ -447,7 +449,7 @@ static void map_staging_buffer(size_t slot, bool releaseSlotOnCompletion = false
           }
           return;
         }
-        ASSERT(status == wgpu::MapAsyncStatus::Success, "Buffer mapping failed: {} {}", magic_enum::enum_name(status),
+        AURORA_ASSERT(status == wgpu::MapAsyncStatus::Success, "Buffer mapping failed: {} {}", magic_enum::enum_name(status),
                message);
         s_mappingStates[slot].store(BufferMapState::Mapped, std::memory_order_release);
         if (releaseSlotOnCompletion) {
@@ -605,7 +607,7 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
 static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, const RenderPass& passInfo);
 static void render_custom_draw(const CustomDrawCommand& draw, const wgpu::RenderPassEncoder& pass,
                                const RenderPass& passInfo);
-static void execute_encoder_task(wgpu::CommandEncoder& cmd, const EncoderTask& task);
+static void execute_encoder_task(wgpu::CommandEncoder& cmd, FramePacket& frame, const EncoderTask& task);
 static void resume_efb_pass_loading(const RenderPass& prevPass);
 static void expire_cached_bind_groups();
 static void push_command(CommandType type, const Command::Data& data);
@@ -633,7 +635,7 @@ static void enqueue_pass(FramePacket& frame, size_t frameSlot, uint32_t passInde
 
 void queue_texture_upload(TextureUpload upload) {
   if (g_currentRenderPass != UINT32_MAX) {
-    ASSERT(!current_render_passes()[g_currentRenderPass].sealed,
+    AURORA_ASSERT(!current_render_passes()[g_currentRenderPass].sealed,
            "Attempted to append texture upload to sealed render pass {}", g_currentRenderPass);
   }
   current_frame_packet().textureUploads.emplace_back(std::move(upload));
@@ -758,7 +760,7 @@ static void push_command(CommandType type, const Command::Data& data) {
       return;
     }
   auto& renderPass = current_render_passes()[g_currentRenderPass];
-  ASSERT(!renderPass.sealed, "Attempted to append command {} to sealed render pass {}", magic_enum::enum_name(type),
+  AURORA_ASSERT(!renderPass.sealed, "Attempted to append command {} to sealed render pass {}", magic_enum::enum_name(type),
          g_currentRenderPass);
   if (type == CommandType::Draw || type == CommandType::CustomDraw) {
     renderPass.hasDraws = true;
@@ -888,7 +890,7 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
 
 void queue_palette_conv(tex_palette_conv::ConvRequest req) {
   auto& renderPass = current_render_passes()[g_currentRenderPass];
-  ASSERT(!renderPass.sealed, "Attempted to append palette conversion to sealed render pass {}", g_currentRenderPass);
+  AURORA_ASSERT(!renderPass.sealed, "Attempted to append palette conversion to sealed render pass {}", g_currentRenderPass);
   renderPass.paletteConvs.push_back(std::move(req));
 }
 
@@ -1240,6 +1242,7 @@ EncoderTaskId register_encoder_task_type(const EncoderTaskDescriptor& desc) {
   slot.label = desc.label != nullptr ? desc.label : "";
   slot.callback = desc.callback;
   slot.userdata = desc.userdata;
+  slot.afterSubmit = desc.afterSubmit;
   return make_draw_type_id(idx, slot.generation);
 }
 
@@ -1253,6 +1256,7 @@ void unregister_encoder_task_type(EncoderTaskId type) noexcept {
   slot.label.clear();
   slot.callback = nullptr;
   slot.userdata = nullptr;
+  slot.afterSubmit = nullptr;
   ++slot.generation;
   g_freeEncoderTaskTypeSlots.push_back(idx);
 }
@@ -1356,7 +1360,6 @@ void initialize() {
   depth_peek::initialize();
   tex_copy_conv::initialize();
   tex_palette_conv::initialize();
-  texture_replacement::initialize();
 
   // For uniform & storage buffer offset alignments
   g_device.GetLimits(&g_cachedLimits);
@@ -1654,7 +1657,7 @@ void finish() {
   if (g_recordingFrame == nullptr) {
     return;
   }
-  ASSERT(!g_inOffscreen, "finish called while offscreen rendering is active");
+  AURORA_ASSERT(!g_inOffscreen, "finish called while offscreen rendering is active");
   if (g_currentRenderPass != UINT32_MAX) {
     auto& frame = current_frame_packet();
     frame.uniforms.append_zeroes(gx::MaxUniformSize);
@@ -1667,8 +1670,8 @@ void finish() {
 
 void end_frame(EndFrameCallback callback) {
   ZoneScoped;
-  ASSERT(!g_inOffscreen, "end_frame called while offscreen rendering is active");
-  ASSERT(g_currentRenderPass == UINT32_MAX, "end_frame called before finish finalized the current render pass");
+  AURORA_ASSERT(!g_inOffscreen, "end_frame called while offscreen rendering is active");
+  AURORA_ASSERT(g_currentRenderPass == UINT32_MAX, "end_frame called before finish finalized the current render pass");
   if (g_cpuFrameStart.time_since_epoch().count() != 0) {
     const auto cpuFrameTime = PresentClock::now() - g_cpuFrameStart;
     update_ema(g_cpuFrameTimeNs, duration_ns(cpuFrameTime));
@@ -1714,6 +1717,7 @@ void end_frame(EndFrameCallback callback) {
     s_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
     auto encoder = std::move(packet.encoder);
     const auto stats = packet.stats;
+    auto afterSubmitCallbacks = std::move(packet.afterSubmitCallbacks);
     packet = {};
     g_stats.drawCallCount = stats.drawCallCount;
     g_stats.mergedDrawCallCount = stats.mergedDrawCallCount;
@@ -1723,7 +1727,7 @@ void end_frame(EndFrameCallback callback) {
     g_stats.lastStorageSize = stats.lastStorageSize;
     g_stats.lastTextureUploadSize = stats.lastTextureUploadSize;
     if (callback) {
-      callback(encoder);
+      callback(encoder, std::move(afterSubmitCallbacks));
     }
     g_frameSlots.release(frameSlot);
     expire_cached_bind_groups();
@@ -1829,7 +1833,7 @@ static void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const Frame
     break;
   case FrameOpType::EncoderTask:
     if (op.encoderTask != nullptr) {
-      execute_encoder_task(cmd, *op.encoderTask);
+      execute_encoder_task(cmd, frame, *op.encoderTask);
     }
     break;
   }
@@ -2046,7 +2050,7 @@ static void render_custom_draw(const CustomDrawCommand& draw, const wgpu::Render
   drawType.draw(context, pass, draw.payload.data(), draw.payloadSize, drawType.userdata);
 }
 
-static void execute_encoder_task(wgpu::CommandEncoder& cmd, const EncoderTask& task) {
+static void execute_encoder_task(wgpu::CommandEncoder& cmd, FramePacket& frame, const EncoderTask& task) {
   RuntimeEncoderTaskType taskType;
   {
     std::lock_guard lock{g_runtimeDrawTypeMutex};
@@ -2067,6 +2071,19 @@ static void execute_encoder_task(wgpu::CommandEncoder& cmd, const EncoderTask& t
       .storageBuffer = g_storageBuffer,
   };
   taskType.callback(context, cmd, task.payload.data(), task.payloadSize, taskType.userdata);
+  if (taskType.afterSubmit != nullptr) {
+    const auto payload = task.payload;
+    const auto payloadSize = task.payloadSize;
+    const auto callback = taskType.afterSubmit;
+    const auto userdata = taskType.userdata;
+    frame.afterSubmitCallbacks.emplace_back([payload, payloadSize, callback, userdata] {
+      const EncoderTaskCompletionContext completionContext{
+          .device = g_device,
+          .queue = g_queue,
+      };
+      callback(completionContext, payload.data(), payloadSize, userdata);
+    });
+  }
 }
 
 static void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, const RenderPass& passInfo) {

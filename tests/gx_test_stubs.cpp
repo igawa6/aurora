@@ -9,6 +9,7 @@
 #include "gfx/tex_copy_conv.hpp"
 #include "gfx/tex_palette_conv.hpp"
 #include "gfx/texture.hpp"
+#include "gfx/texture_replacement.hpp"
 #include "gx/pipeline.hpp"
 #include "gx/shader_info.hpp"
 #include "internal.hpp"
@@ -63,6 +64,9 @@ void configure(const GXRenderModeObj*) noexcept {}
 // --- get_texture ---
 namespace aurora::gx {
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept { return g_gxState.textures[id]; }
+namespace texture {
+void invalidate_bindings() noexcept {}
+} // namespace texture
 void evict_texture_object(u32 texObjId) noexcept {
   for (auto& obj : g_gxState.loadedTextures) {
     if (obj.texObjId == texObjId) {
@@ -240,7 +244,6 @@ void queue(ConvRequest req) {}
 
 namespace aurora::gfx::texture_replacement {
 u32 compute_texture_upload_size(const GXTexObj_& obj) noexcept { return 0; }
-std::optional<TextureHandle> find_replacement(const GXTexObj_&) noexcept { return std::nullopt; }
 bool has_replacement(const GXTexObj_&) noexcept { return false; }
 bool has_replacement(const GXTexObj_&, const GXTlutObj_&) noexcept { return false; }
 } // namespace aurora::gfx::texture_replacement

@@ -52,18 +52,6 @@ struct ConvertedTexture {
 // Returns converted bytes when Aurora must transform the source layout before upload.
 // Empty data means callers should upload the original bytes directly using to_wgpu(format).
 // hasArbitraryMips is only meaningful for decoded RGBA8 GC formats; PC formats skip that check.
-// Decompress a BC-compressed replacement to RGBA8 on the CPU.
-//
-// For devices whose GPU cannot sample BC at all — which is every Android GPU,
-// BC being a desktop format — so a BC1/BC3 texture pack loads there instead of
-// being rejected outright. Returns an empty buffer for formats with no decoder
-// (BC5, BC6H, BC7), leaving the caller to reject as before.
-//
-// Costs memory rather than saving it: the result is uncompressed. It buys
-// compatibility, not footprint; the cache budget is what bounds the footprint.
-ByteBuffer decompress_bc_to_rgba8(wgpu::TextureFormat format, uint32_t width, uint32_t height, uint32_t mips,
-                                  ArrayRef<uint8_t> data);
-
 ConvertedTexture convert_texture(u32 format, uint32_t width, uint32_t height, uint32_t mips, ArrayRef<uint8_t> data);
 ConvertedTexture convert_texture_palette(u32 textureFormat, uint32_t width, uint32_t height, uint32_t mips,
                                          ArrayRef<uint8_t> textureData, GXTlutFmt tlutFormat, uint16_t tlutEntries,

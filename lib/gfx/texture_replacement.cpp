@@ -669,27 +669,6 @@ struct VirtualTextureSource {
   std::optional<gfx::ConvertedTexture> load_mip() { return decode(); }
 };
 
-// BC is a desktop format; no Android GPU can sample it, so a BC1/BC3 pack used
-// to be rejected file by file and the player got no textures at all. Decode it
-// to RGBA8 instead and carry on. Returns false when there is no decoder for the
-// format (BC5/BC6H/BC7), leaving the caller to reject as before.
-//
-// This makes those packs work, not cheap: the result is uncompressed, so it
-// costs 4-8x the memory the compressed form would have. The cache budget is
-// what keeps that in bounds.
-bool decompress_unsupported_bc(gfx::ConvertedTexture& texture, std::string_view label) noexcept {
-  auto rgba = gfx::decompress_bc_to_rgba8(texture.format, texture.width, texture.height, texture.mips,
-                                          {texture.data.data(), texture.data.size()});
-  if (rgba.empty()) {
-    return false;
-  }
-  Log.info("texture_replacement: decoded {} from BC {} to RGBA8 (this GPU cannot sample BC)", label,
-           static_cast<uint32_t>(texture.format));
-  texture.format = wgpu::TextureFormat::RGBA8Unorm;
-  texture.data = std::move(rgba);
-  return true;
-}
-
 template <typename Source>
 std::optional<gfx::ConvertedTexture> load_encoded_replacement(Source&& src) noexcept {
   auto base = src.load_base();
@@ -697,7 +676,7 @@ std::optional<gfx::ConvertedTexture> load_encoded_replacement(Source&& src) noex
     Log.warn("texture_replacement: failed to load texture {}", src.name());
     return std::nullopt;
   }
-  if (is_unsupported_texture_format(base->format) && !decompress_unsupported_bc(*base, src.name())) {
+  if (is_unsupported_texture_format(base->format)) {
     Log.warn("texture_replacement: failed to load texture {} due to unsupported format: {}", src.name(),
              static_cast<uint32_t>(base->format));
     return std::nullopt;

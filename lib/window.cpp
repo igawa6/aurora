@@ -2,6 +2,7 @@
 
 #ifdef AURORA_ENABLE_GX
 #include "aux_window.hpp"
+#include "gfx/texture_replacement.hpp"
 #include "imgui.hpp"
 #include "webgpu/gpu.hpp"
 #endif
@@ -175,6 +176,7 @@ bool SDLCALL lifecycle_event_watch(void*, SDL_Event* event) {
     default:
       break;
     }
+  }
   return true;
 }
 

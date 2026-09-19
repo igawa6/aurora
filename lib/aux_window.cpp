@@ -200,6 +200,9 @@ bool create(const CreateInfo& info) {
   }
 
   SDL_WindowFlags flags = SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_RESIZABLE;
+  if (info.hidden) {
+    flags |= SDL_WINDOW_HIDDEN;
+  }
   Sint32 posX = info.posX < 0 ? SDL_WINDOWPOS_UNDEFINED : info.posX;
   Sint32 posY = info.posY < 0 ? SDL_WINDOWPOS_UNDEFINED : info.posY;
   if (info.displayIndex >= 0) {

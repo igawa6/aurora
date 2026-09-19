@@ -14,6 +14,11 @@ struct CreateInfo {
   int32_t posX = -1;         // -1 = window-manager placement
   int32_t posY = -1;
   int32_t displayIndex = -1; // >= 0: center on that display (overrides posX/posY)
+  // Never mapped to the screen. The surface/swapchain still exists and
+  // present()/request_capture()/take_capture() all still work normally — this
+  // is for consumers that only want the rendered pixels (e.g. pushed over the
+  // network) and have no on-screen use for the window itself.
+  bool hidden = false;
 };
 
 /// Create the auxiliary display-only window. Requires the graphics device to be

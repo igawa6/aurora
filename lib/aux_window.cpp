@@ -199,7 +199,10 @@ bool create(const CreateInfo& info) {
     return true;
   }
 
-  SDL_WindowFlags flags = SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_RESIZABLE;
+  SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE;
+  if (!info.exactPixelSize) {
+    flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
+  }
   if (info.hidden) {
     flags |= SDL_WINDOW_HIDDEN;
   }

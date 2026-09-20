@@ -19,6 +19,15 @@ struct CreateInfo {
   // is for consumers that only want the rendered pixels (e.g. pushed over the
   // network) and have no on-screen use for the window itself.
   bool hidden = false;
+  // When true, width/height are the EXACT backing pixel-buffer size to
+  // create, with no further DPI scaling applied — for callers that already
+  // resolved a real device's pixel resolution themselves (e.g. a phone's
+  // reported width*devicePixelRatio) and would otherwise get it silently
+  // multiplied again by the desktop's own display content scale (SDL3's
+  // SDL_WINDOW_HIGH_PIXEL_DENSITY treats width/height as DPI-independent
+  // points, not pixels). Leave false for a real on-screen window, where
+  // normal DPI-aware sizing is what's wanted.
+  bool exactPixelSize = false;
 };
 
 /// Create the auxiliary display-only window. Requires the graphics device to be
